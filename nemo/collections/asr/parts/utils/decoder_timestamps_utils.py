@@ -1,3 +1,4 @@
+
 # Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -95,9 +96,9 @@ class WERBPE_TS(WERBPE):
 
             hypothesis = self.decode_tokens_to_str_with_ts(decoded_prediction)
             hypothesis = hypothesis.replace(unk, '')
-            word_ts = self.get_ts_from_decoded_prediction(decoded_prediction, hypothesis, char_ts)
+            word_ts, word_seq = self.get_ts_from_decoded_prediction(decoded_prediction, hypothesis, char_ts)
 
-            hypotheses.append(hypothesis)
+            hypotheses.append(" ".join(word_seq))
             timestamps.append(timestamp_list)
             word_timestamps.append(word_ts)
         return hypotheses, timestamps, word_timestamps
@@ -110,7 +111,9 @@ class WERBPE_TS(WERBPE):
         token_list = self.decoding.tokenizer.ids_to_tokens(tokens)
         return token_list
 
-    def get_ts_from_decoded_prediction(self, decoded_prediction: List[str], hypothesis: List[str], char_ts: List[str]):
+    def get_ts_from_decoded_prediction(
+        self, decoded_prediction: List[str], hypothesis: str, char_ts: List[str]
+    ) -> Tuple[List[List[float]], List[str]]:
         decoded_char_list = self.decoding.tokenizer.ids_to_tokens(decoded_prediction)
         stt_idx, end_idx = 0, len(decoded_char_list) - 1
         stt_ch_idx, end_ch_idx = 0, 0
@@ -122,10 +125,8 @@ class WERBPE_TS(WERBPE):
             # If the symbol is space and not an end of the utterance, move on
             if idx != end_idx and (space == ch and space in decoded_char_list[idx + 1]):
                 continue
-            # If the symbol is unkown symbol such as '<unk>' symbol, move on
-            elif ch in ['<unk>']:
-                continue
 
+            # If the word does not containg space (the start of the word token), keep counting
             if (idx == stt_idx or space == decoded_char_list[idx - 1] or (space in ch and len(ch) > 1)) and (
                 ch != space
             ):
@@ -133,15 +134,20 @@ class WERBPE_TS(WERBPE):
                 stt_ch_idx = idx
                 word_open_flag = True
 
-            if word_open_flag and ch != space and (idx == end_idx or space in decoded_char_list[idx + 1]):
+            # If this char has `word_open_flag=True` and meets any of one of the following condition:
+            # (1) last word (2) unknown word (3) start symbol in the following word,
+            # close the `word_open_flag` and add the word to the `word_seq` list.
+            close_cond = idx == end_idx or ch in ['<unk>'] or space in decoded_char_list[idx + 1]
+            if (word_open_flag and ch != space) and close_cond:
                 _end = round(char_ts[idx] + self.time_stride, 2)
                 end_ch_idx = idx
                 word_open_flag = False
                 word_ts.append([_stt, _end])
                 stitched_word = ''.join(decoded_char_list[stt_ch_idx : end_ch_idx + 1]).replace(space, '')
                 word_seq.append(stitched_word)
+
         assert len(word_ts) == len(hypothesis.split()), "Text hypothesis does not match word timestamps."
-        return word_ts
+        return word_ts, word_seq
 
 
 class WER_TS(WER):
@@ -432,7 +438,7 @@ class ASRDecoderTimeStamps:
                     logging.info(
                         f"Running beam-search decoder on {uniq_id} with LM {self.ctc_decoder_params['pretrained_language_model']}"
                     )
-                    hyp_words, word_ts = self.run_pyctcdecode(logit_np)
+                    hyp_words, word_ts,beam = self.run_pyctcdecode(logit_np)
                 else:
                     log_prob = torch.from_numpy(logit_np)
                     logits_len = torch.from_numpy(np.array([log_prob.shape[0]]))
@@ -440,6 +446,7 @@ class ASRDecoderTimeStamps:
                     text, char_ts = wer_ts.ctc_decoder_predictions_tensor_with_ts(
                         greedy_predictions, predictions_len=logits_len
                     )
+                    beam = char_ts
                     trans, char_ts_in_feature_frame_idx = self.clean_trans_and_TS(text[0], char_ts[0])
                     spaces_in_sec, hyp_words = self._get_spaces(
                         trans, char_ts_in_feature_frame_idx, self.model_stride_in_secs
@@ -452,7 +459,7 @@ class ASRDecoderTimeStamps:
                 words_dict[uniq_id] = hyp_words
                 word_ts_dict[uniq_id] = word_ts
 
-        return words_dict, word_ts_dict
+        return words_dict, word_ts_dict,[transcript_logits_list,beam]
 
     @staticmethod
     def clean_trans_and_TS(trans: str, char_ts: List[str]) -> Tuple[str, List[str]]:
@@ -524,6 +531,7 @@ class ASRDecoderTimeStamps:
         return spaces_in_sec, word_list
 
     def run_ASR_CitriNet_CTC(self, asr_model: Type[EncDecCTCModelBPE]) -> Tuple[Dict, Dict]:
+        
         """
         Launch CitriNet ASR model and collect logit, timestamps and text output.
 
@@ -604,6 +612,9 @@ class ASRDecoderTimeStamps:
         return onset_delay, mid_delay, tokens_per_chunk
 
     def run_ASR_BPE_CTC(self, asr_model: Type[EncDecCTCModelBPE]) -> Tuple[Dict, Dict]:
+        
+        print('############################## run_ASR_BPE_CTC ')
+
         """
         Launch CTC-BPE based ASR model and collect logit, timestamps and text output.
 
@@ -642,7 +653,8 @@ class ASRDecoderTimeStamps:
 
         with torch.cuda.amp.autocast():
             logging.info(f"Running ASR model {self.ASR_model_name}")
-
+            
+            logits=[]
             for idx, audio_file_path in enumerate(self.audio_file_list):
                 uniq_id = get_uniqname_from_filepath(audio_file_path)
                 logging.info(f"[{idx+1}/{len(self.audio_file_list)}] FrameBatchASR: {audio_file_path}")
@@ -661,7 +673,9 @@ class ASRDecoderTimeStamps:
                         f"Running beam-search decoder with LM {self.ctc_decoder_params['pretrained_language_model']}"
                     )
                     log_prob = log_prob.unsqueeze(0).cpu().numpy()[0]
-                    hyp_words, word_ts = self.run_pyctcdecode(log_prob, onset_delay_in_sec=onset_delay_in_sec)
+                    hyp_words, word_ts, beam = self.run_pyctcdecode(log_prob, onset_delay_in_sec=onset_delay_in_sec)
+                    logits.append(log_prob)
+
                 else:
                     logits_len = torch.from_numpy(np.array([len(greedy_predictions_list)]))
                     greedy_predictions_list = greedy_predictions_list[onset_delay:]
@@ -669,14 +683,18 @@ class ASRDecoderTimeStamps:
                     text, char_ts, word_ts = werbpe_ts.ctc_decoder_predictions_tensor_with_ts(
                         self.model_stride_in_secs, greedy_predictions, predictions_len=logits_len
                     )
+                                        
+                    beam = char_ts
                     hyp_words, word_ts = text[0].split(), word_ts[0]
+                    logits.append(log_prob.unsqueeze(0).cpu().numpy()[0])
+
 
                 word_ts = self.align_decoder_delay(word_ts, self.decoder_delay_in_sec)
                 assert len(hyp_words) == len(word_ts), "Words and word timestamp list length does not match."
                 words_dict[uniq_id] = hyp_words
                 word_ts_dict[uniq_id] = word_ts
 
-        return words_dict, word_ts_dict
+        return words_dict, word_ts_dict,[logits,beam]
 
     def get_word_ts_from_spaces(self, char_ts: List[float], spaces_in_sec: List[float], end_stamp: float) -> List[str]:
         """
@@ -740,7 +758,7 @@ class ASRDecoderTimeStamps:
             word_ts_beam.append(ts)
             words_beam.append(word)
         hyp_words, word_ts = words_beam, word_ts_beam
-        return hyp_words, word_ts
+        return hyp_words, word_ts, beams
 
     @staticmethod
     def get_word_ts_from_wordframes(
